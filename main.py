@@ -85,6 +85,16 @@ MIN_SIZE_P = 0.001   # min probability to emit a sizes row
 # with the read's horizon, so the 7-13 h final reads stay pure Monte Carlo.
 BLEND_TAU_MIN = float(os.environ.get("MF_BLEND_TAU", "120.0"))
 BLEND_SCALE = float(os.environ.get("MF_BLEND_SCALE", "1.0"))
+# v5 (round 4, ORDER-focused) knobs, all default to v4 behavior:
+# MF_W_MIN: floor on the place-probability persistence weight (the round-1
+#   blend decays to ~0 at 7-13 h; a floor keeps some incumbent mass there).
+# MF_NC_LONG_SCALE: newcomer draws per read once step > 36 (6 h) — fewer
+#   newcomers at long horizons lets incumbents keep named mass.
+# MF_SHARPEN: power applied to blended place probs (renormalized to the same
+#   sum) — concentrates named mass on the most likely coins.
+W_MIN = float(os.environ.get("MF_W_MIN", "0.20"))  # v5: persistence floor at long horizons (round 4, verified +1.52 nats on realistic 7-13h test)
+NC_LONG_SCALE = float(os.environ.get("MF_NC_LONG_SCALE", "0.5"))  # v5: halve newcomer draws past 6h (round 4, stacked with W_MIN 0.20)
+SHARPEN = float(os.environ.get("MF_SHARPEN", "1.0"))
 P_STAY = 0.30
 P_NEIGHBOUR = 0.10
 SIZE_SD = 0.35
@@ -321,7 +331,8 @@ def main():
                 # anchor carries the level's growth with it.
                 ref = last_place1 if NEWCOMER_ANCHOR else (max(sizes) if sizes else last_place1)
                 entries = [(sizes[i], i) for i in range(n_cand)]
-                for _ in range(NEWCOMERS_PER_READ):
+                n_nc = NEWCOMERS_PER_READ if step <= 36 else max(1, int(round(NEWCOMERS_PER_READ * NC_LONG_SCALE)))
+                for _ in range(n_nc):
                     delta = newcomer_deltas[rng.randrange(len(newcomer_deltas))]
                     entries.append((ref + delta, -1))
                 top = heapq.nlargest(places, entries, key=lambda e: e[0])
@@ -359,6 +370,7 @@ def main():
     weights_size = []
     for ri in range(n_reads):
         w = persist_rate * math.exp(-gaps_min[ri] / BLEND_TAU_MIN) * BLEND_SCALE
+        w = max(w, W_MIN)
         weights.append(min(1.0, max(0.0, w)))
         ws = persist_rate * math.exp(-gaps_min[ri] / SIZE_TAU_MIN) * BLEND_SCALE
         weights_size.append(min(1.0, max(0.0, ws)))
@@ -412,6 +424,14 @@ def main():
                 if pb > 0:
                     blended_size[k][b] = blended_size[k].get(b, 0.0) + pb
 
+    if SHARPEN != 1.0:
+        for k in range(places):
+            tot = sum(blended[k].values())
+            if tot > 0:
+                pw = {m: p ** SHARPEN for m, p in blended[k].items()}
+                s = sum(pw.values())
+                if s > 0:
+                    blended[k] = {m: v * tot / s for m, v in pw.items()}
     probabilities = []
     for k in range(places):
         rows = [(p, mint) for mint, p in blended[k].items() if p >= MIN_P]
