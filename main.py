@@ -92,8 +92,8 @@ BLEND_SCALE = float(os.environ.get("MF_BLEND_SCALE", "1.0"))
 #   newcomers at long horizons lets incumbents keep named mass.
 # MF_SHARPEN: power applied to blended place probs (renormalized to the same
 #   sum) — concentrates named mass on the most likely coins.
-W_MIN = float(os.environ.get("MF_W_MIN", "0.20"))  # v5: persistence floor at long horizons (round 4, verified +1.52 nats on realistic 7-13h test)
-NC_LONG_SCALE = float(os.environ.get("MF_NC_LONG_SCALE", "0.5"))  # v5: halve newcomer draws past 6h (round 4, stacked with W_MIN 0.20)
+W_MIN = float(os.environ.get("MF_W_MIN", "0.30"))  # v6: persistence floor 0.30 (round 5 STACK, verified +0.315 nats on realistic 7-13h test, wins 4/4 cells)
+NC_LONG_SCALE = float(os.environ.get("MF_NC_LONG_SCALE", "0.25"))  # v6: newcomer draws x0.25 past 6h (round 5 STACK, stacked with W_MIN 0.30)
 SHARPEN = float(os.environ.get("MF_SHARPEN", "1.0"))
 P_STAY = 0.30
 P_NEIGHBOUR = 0.10
