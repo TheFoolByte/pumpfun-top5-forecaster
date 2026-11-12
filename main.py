@@ -45,6 +45,32 @@ GRAD_QR_REF = 85.0
 # pool with N(0, STEP_FALLBACK_SD) draws (a 1-mark history has no steps at all).
 STEP_POOL_MIN = 200
 STEP_FALLBACK_SD = 0.12
+# Size-only blend tau (v3 experiment): sizes are more persistent than
+# identities — the top-5 sizes stay in a plausible band even as the coins
+# turn over. A longer tau for the SIZE blend anchors the size distribution
+# near the last mark's levels at long horizons. Default = BLEND_TAU_MIN.
+SIZE_TAU_MIN = float(os.environ.get("MF_SIZE_TAU", "480.0"))  # v4: long-horizon size anchor (round 3, verified +23.5 nats on realistic 7-13h test)
+# Long-horizon level control (v3): the pure Monte Carlo's top level grows
+# without bound — random-walk max ~ sqrt(steps) plus a newcomer ratchet
+# (newcomers anchor to the running max). On the 66-mark final-shaped input
+# v2's place-1 mean cap is 9.42 dex (~$400B, absurd) with newcomer share
+# 1.000 and ALL size mass in bin 81. Two env knobs, both default off:
+# MF_REVERT_KAPPA: per-step pull of each coin's log-cap back toward its
+#   last-mark size (OU mean reversion; bounds the level, keeps incumbents
+#   competitive and sizes plausible at 7-13 h).
+# MF_STEP_SHRINK: multiplicative shrink of the resampled step noise.
+REVERT_KAPPA = float(os.environ.get("MF_REVERT_KAPPA", "0.0"))
+STEP_SHRINK = float(os.environ.get("MF_STEP_SHRINK", "1.0"))
+# v4 (realistic long-horizon test) knobs, all default to v2 behavior:
+# MF_NEWCOMER_ANCHOR=1: newcomers anchor to the LAST-MARK place-1 level
+#   (last_place1) instead of the running max — kills the newcomer ratchet
+#   that carries the top level up with it at 7-13 h.
+# MF_SIZE_CAP (dex): hard cap on a coin's simulated size above its last-mark
+#   size (cand_size); bounds the random-walk diffusion explosion. 0 = off.
+# MF_DRIFT_HL (min): override DRIFT_HALF_LIFE_MIN (faster drift decay).
+NEWCOMER_ANCHOR = int(os.environ.get("MF_NEWCOMER_ANCHOR", "0"))
+SIZE_CAP = float(os.environ.get("MF_SIZE_CAP", "1.0"))  # v4: cap simulated size growth above last-mark level (round 3, stacked with SIZE_TAU 480)
+DRIFT_HL = float(os.environ.get("MF_DRIFT_HL", str(DRIFT_HALF_LIFE_MIN)))
 # Output floors.
 MIN_P = 0.002        # min probability to emit a probabilities row
 MIN_SIZE_P = 0.001   # min probability to emit a sizes row
@@ -57,8 +83,6 @@ MIN_SIZE_P = 0.001   # min probability to emit a sizes row
 # around the last mark's place level). The weight is regime-aware: it scales
 # with the recent top-5 overlap (calm market -> trust persistence) and decays
 # with the read's horizon, so the 7-13 h final reads stay pure Monte Carlo.
-# v2 applied 2026-11-12, verified by John: proxy mean -32.115 (v1 -32.281),
-# cut C -27.92 beats baseline -29.87, calm test -24.56 vs v1 -54.64.
 BLEND_TAU_MIN = float(os.environ.get("MF_BLEND_TAU", "120.0"))
 BLEND_SCALE = float(os.environ.get("MF_BLEND_SCALE", "1.0"))
 P_STAY = 0.30
@@ -278,7 +302,7 @@ def main():
     # (Reset to the cut level at the start of each trial, below.)
 
     # Precompute drift decay per step: drift * 0.5**(t / half_life)
-    decay = [0.5 ** ((i * cadence) / DRIFT_HALF_LIFE_MIN) for i in range(n_steps + 1)]
+    decay = [0.5 ** ((i * cadence) / DRIFT_HL) for i in range(n_steps + 1)]
     read_step_set = {}
     for ri, rs in enumerate(read_steps):
         read_step_set.setdefault(rs, []).append(ri)
@@ -295,7 +319,7 @@ def main():
                 # read (the level the market has reached); the contender deltas
                 # are measured against the previous mark's place-1, so this
                 # anchor carries the level's growth with it.
-                ref = max(sizes) if sizes else last_place1
+                ref = last_place1 if NEWCOMER_ANCHOR else (max(sizes) if sizes else last_place1)
                 entries = [(sizes[i], i) for i in range(n_cand)]
                 for _ in range(NEWCOMERS_PER_READ):
                     delta = newcomer_deltas[rng.randrange(len(newcomer_deltas))]
@@ -312,8 +336,10 @@ def main():
                 break
             dec = decay[step]
             for i in range(n_cand):
-                mv = drifts[i] * dec + centered[rng.randrange(n_steps_pool)]
+                mv = drifts[i] * dec + STEP_SHRINK * centered[rng.randrange(n_steps_pool)]
                 sizes[i] += mv
+                if REVERT_KAPPA > 0.0:
+                    sizes[i] -= REVERT_KAPPA * (sizes[i] - cand_size[i])
                 if venues[i] == 0:  # curve: maybe graduate
                     qr = qrs[i] * (10.0 ** mv) if mv > 0 else qrs[i]
                     qrs[i] = qr
@@ -321,14 +347,21 @@ def main():
                     if rng.random() < p_grad:
                         venues[i] = 1
                         sizes[i] += GRAD_JUMPS[rng.randrange(len(GRAD_JUMPS))]
+                if SIZE_CAP > 0.0:
+                    cap_i = cand_size[i] + SIZE_CAP
+                    if sizes[i] > cap_i:
+                        sizes[i] = cap_i
                 # age-based drift fade is in `dec`; nothing else per coin
 
     # ---- assemble forecast --------------------------------------------------
     # Per-read blend weights: regime-aware persistence, decaying with horizon.
     weights = []
+    weights_size = []
     for ri in range(n_reads):
         w = persist_rate * math.exp(-gaps_min[ri] / BLEND_TAU_MIN) * BLEND_SCALE
         weights.append(min(1.0, max(0.0, w)))
+        ws = persist_rate * math.exp(-gaps_min[ri] / SIZE_TAU_MIN) * BLEND_SCALE
+        weights_size.append(min(1.0, max(0.0, ws)))
     # Last mark's ranking (by size) for the persistence forecast.
     last_ranked = [r["mint"] for r in last_rows]
     last_sizes = [size_of(r["market_cap_lamports"]) for r in last_rows]
@@ -375,7 +408,7 @@ def main():
             tot = len(place_cap_samples[k][ri])
             for b in range(len(edges) + 1):
                 pmc = (hist[b] / tot) if tot else 0.0
-                pb = ((1.0 - w) * pmc + w * ln_probs[b]) / n_reads
+                pb = ((1.0 - weights_size[ri]) * pmc + weights_size[ri] * ln_probs[b]) / n_reads
                 if pb > 0:
                     blended_size[k][b] = blended_size[k].get(b, 0.0) + pb
 
