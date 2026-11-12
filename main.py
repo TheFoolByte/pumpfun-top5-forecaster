@@ -48,6 +48,22 @@ STEP_FALLBACK_SD = 0.12
 # Output floors.
 MIN_P = 0.002        # min probability to emit a probabilities row
 MIN_SIZE_P = 0.001   # min probability to emit a sizes row
+# Persistence blend: the Monte Carlo diffuses too far at short horizons — it
+# gives place 1 to newcomers in ~95% of trials and extrapolates the rally, so
+# its size distributions sit ~+0.4 dex above the last mark (real practice
+# -46.79 vs baseline -40.41, while the proxy said the opposite). Blend each
+# read's place probabilities and size histograms with the house baseline's
+# persistence forecast (0.30 stay / 0.10 neighbours; sizes lognormal sd 0.35
+# around the last mark's place level). The weight is regime-aware: it scales
+# with the recent top-5 overlap (calm market -> trust persistence) and decays
+# with the read's horizon, so the 7-13 h final reads stay pure Monte Carlo.
+# v2 applied 2026-11-12, verified by John: proxy mean -32.115 (v1 -32.281),
+# cut C -27.92 beats baseline -29.87, calm test -24.56 vs v1 -54.64.
+BLEND_TAU_MIN = float(os.environ.get("MF_BLEND_TAU", "120.0"))
+BLEND_SCALE = float(os.environ.get("MF_BLEND_SCALE", "1.0"))
+P_STAY = 0.30
+P_NEIGHBOUR = 0.10
+SIZE_SD = 0.35
 
 # Empirical newcomer size deltas vs the previous mark's place-1 size
 # (practice history, top-5 entrants only) — fallback when the history yields
@@ -74,6 +90,37 @@ def build_newcomer_deltas(marks):
     if len(deltas) < 10:
         return list(NEWCOMER_DELTAS)
     return deltas
+
+
+def top5_persist_rate(marks):
+    """Recency-weighted (2,1) mean top-5 overlap over the last <=2 transitions
+    of the training history; 0.5 when there is no transition to learn from.
+    The practice history shows the regime flip this captures: early transitions
+    overlap 1/5 (wild churn) while the last two overlap 4/5 (calm)."""
+    overlaps = []
+    for prev, cur in zip(marks, marks[1:]):
+        if not prev["rows"] or not cur["rows"]:
+            continue
+        prev5 = {r["mint"] for r in sorted(prev["rows"], key=lambda r: -int(r["market_cap_lamports"]))[:5]}
+        cur5 = {r["mint"] for r in sorted(cur["rows"], key=lambda r: -int(r["market_cap_lamports"]))[:5]}
+        overlaps.append(len(prev5 & cur5) / 5.0)
+    if not overlaps:
+        return 0.5
+    if len(overlaps) == 1:
+        return overlaps[0]
+    return (2 * overlaps[-1] + overlaps[-2]) / 3.0
+
+
+def lognormal_bin_probs(mean, sd, edges):
+    """P(X in bin) for X ~ N(mean, sd) over the 82 bins from edges."""
+    out = []
+    for b in range(len(edges) + 1):
+        lo = float("-inf") if b == 0 else edges[b - 1]
+        hi = float("inf") if b == len(edges) else edges[b]
+        plo = 0.0 if lo == float("-inf") else 0.5 * (1.0 + math.erf((lo - mean) / (sd * math.sqrt(2.0))))
+        phi = 1.0 if hi == float("inf") else 0.5 * (1.0 + math.erf((hi - mean) / (sd * math.sqrt(2.0))))
+        out.append(max(0.0, phi - plo))
+    return out
 
 
 def parse_time(s):
@@ -212,6 +259,7 @@ def main():
         cand_age_min.append(max(0.0, (last_t - s["created"]) / 60.0))
     n_cand = len(cands)
     last_place1 = max(cand_size) if cand_size else 3.0
+    persist_rate = top5_persist_rate(marks)
 
     # ---- trials ------------------------------------------------------------
     trials = MAX_TRIALS
@@ -220,9 +268,9 @@ def main():
         trials = max(MIN_TRIALS, min(MAX_TRIALS, trials))
     rng = random.Random(SEED)
     n_reads = len(read_times)
-    place_counts = [[0] * n_cand for _ in range(places)]
-    newcomer_counts = [0] * places
-    place_cap_samples = [[] for _ in range(places)]
+    place_counts = [[[0] * n_cand for _ in range(n_reads)] for _ in range(places)]
+    newcomer_counts = [[0] * n_reads for _ in range(places)]
+    place_cap_samples = [[[] for _ in range(n_reads)] for _ in range(places)]
     total_samples = trials * n_reads
     # ref_level: the place-1 size as of the previous read (cut level first).
     # Newcomers are anchored to it, so the top level can ratchet up when a
@@ -253,12 +301,13 @@ def main():
                     delta = newcomer_deltas[rng.randrange(len(newcomer_deltas))]
                     entries.append((ref + delta, -1))
                 top = heapq.nlargest(places, entries, key=lambda e: e[0])
-                for k, (cap, idx) in enumerate(top):
-                    place_cap_samples[k].append(cap)
-                    if idx >= 0:
-                        place_counts[k][idx] += 1
-                    else:
-                        newcomer_counts[k] += 1
+                for ri in read_step_set[step]:
+                    for k, (cap, idx) in enumerate(top):
+                        place_cap_samples[k][ri].append(cap)
+                        if idx >= 0:
+                            place_counts[k][ri][idx] += 1
+                        else:
+                            newcomer_counts[k][ri] += 1
             if step == n_steps:
                 break
             dec = decay[step]
@@ -275,15 +324,64 @@ def main():
                 # age-based drift fade is in `dec`; nothing else per coin
 
     # ---- assemble forecast --------------------------------------------------
+    # Per-read blend weights: regime-aware persistence, decaying with horizon.
+    weights = []
+    for ri in range(n_reads):
+        w = persist_rate * math.exp(-gaps_min[ri] / BLEND_TAU_MIN) * BLEND_SCALE
+        weights.append(min(1.0, max(0.0, w)))
+    # Last mark's ranking (by size) for the persistence forecast.
+    last_ranked = [r["mint"] for r in last_rows]
+    last_sizes = [size_of(r["market_cap_lamports"]) for r in last_rows]
+
+    def persist_place_probs(k):
+        """Baseline persistence distribution for place k (0-based): 0.30 on
+        the coin at #k, 0.10 on each neighbour."""
+        d = {last_ranked[k]: P_STAY}
+        if k > 0:
+            d[last_ranked[k - 1]] = d.get(last_ranked[k - 1], 0.0) + P_NEIGHBOUR
+        if k + 1 < len(last_ranked):
+            d[last_ranked[k + 1]] = d.get(last_ranked[k + 1], 0.0) + P_NEIGHBOUR
+        return d
+
+    def bin_of(cap):
+        lo, hi = 0, len(edges)
+        while lo < hi:
+            mid = (lo + hi) >> 1
+            if edges[mid] <= cap:
+                lo = mid + 1
+            else:
+                hi = mid
+        return lo
+
+    # Blended per-place probabilities and size histograms, averaged over reads.
+    blended = [dict() for _ in range(places)]       # place -> mint -> p
+    blended_size = [dict() for _ in range(places)]  # place -> bin -> p
+    for k in range(places):
+        per = persist_place_probs(k)
+        ln_probs = lognormal_bin_probs(last_sizes[k], SIZE_SD, edges)
+        for ri in range(n_reads):
+            w = weights[ri]
+            for i in range(n_cand):
+                c = place_counts[k][ri][i]
+                if c:
+                    pmc = c / trials
+                    mint = cands[i]
+                    blended[k][mint] = blended[k].get(mint, 0.0) + ((1.0 - w) * pmc) / n_reads
+            for mint, pp in per.items():
+                blended[k][mint] = blended[k].get(mint, 0.0) + (w * pp) / n_reads
+            hist = [0] * (len(edges) + 1)
+            for cap in place_cap_samples[k][ri]:
+                hist[bin_of(cap)] += 1
+            tot = len(place_cap_samples[k][ri])
+            for b in range(len(edges) + 1):
+                pmc = (hist[b] / tot) if tot else 0.0
+                pb = ((1.0 - w) * pmc + w * ln_probs[b]) / n_reads
+                if pb > 0:
+                    blended_size[k][b] = blended_size[k].get(b, 0.0) + pb
+
     probabilities = []
     for k in range(places):
-        rows = []
-        for i in range(n_cand):
-            c = place_counts[k][i]
-            if c:
-                p = c / total_samples
-                if p >= MIN_P:
-                    rows.append((p, cands[i]))
+        rows = [(p, mint) for mint, p in blended[k].items() if p >= MIN_P]
         rows.sort(key=lambda x: (-x[0], x[1]))
         for p, mint in rows[:100]:
             probabilities.append({"mint": mint, "place": k + 1, "p": round(p, 6)})
@@ -291,12 +389,9 @@ def main():
     in_top5 = {}
     exp_rank = {}
     for k in range(places):
-        for i in range(n_cand):
-            c = place_counts[k][i]
-            if c:
-                p = c / total_samples
-                in_top5[cands[i]] = in_top5.get(cands[i], 0.0) + p
-                exp_rank[cands[i]] = exp_rank.get(cands[i], 0.0) + (k + 1) * p
+        for mint, p in blended[k].items():
+            in_top5[mint] = in_top5.get(mint, 0.0) + p
+            exp_rank[mint] = exp_rank.get(mint, 0.0) + (k + 1) * p
     ranked = sorted(in_top5.items(), key=lambda kv: (-kv[1], exp_rank[kv[0]] / kv[1], kv[0]))
     top5 = [m for m, _ in ranked[:places]]
     # pad (should not happen) with last mark's top coins
@@ -306,31 +401,10 @@ def main():
                 top5.append(r["mint"])
             if len(top5) >= places:
                 break
-    # sizes: histogram place-cap samples into bins
+    # sizes: blended histograms, keep sum <= 1 after 6-dp rounding
     sizes_out = []
     for k in range(places):
-        samples = place_cap_samples[k]
-        if not samples:
-            continue
-        hist = [0] * (len(edges) + 1)
-        for cap in samples:
-            b = 0
-            # bin_of(cap)
-            lo, hi = 0, len(edges)
-            while lo < hi:
-                mid = (lo + hi) >> 1
-                if edges[mid] <= cap:
-                    lo = mid + 1
-                else:
-                    hi = mid
-            hist[lo] += 1
-        tot = len(samples)
-        rows = []
-        for b, c in enumerate(hist):
-            if c:
-                p = c / tot
-                if p >= MIN_SIZE_P:
-                    rows.append((p, b))
+        rows = [(p, b) for b, p in blended_size[k].items() if p >= MIN_SIZE_P]
         # keep sum <= 1 after 6-dp rounding: round down like the baseline
         ssum = 0.0
         for p, b in sorted(rows, key=lambda x: -x[0]):
@@ -340,12 +414,15 @@ def main():
                 ssum += rp
     forecast = {"probabilities": probabilities, "top5": top5, "sizes": sizes_out}
     if os.environ.get("MAKEFUN_DEBUG"):
+        print(f"[debug] persist_rate={persist_rate:.2f} weights={[round(w, 2) for w in weights]}", file=sys.stderr)
         for k in range(places):
             named_sum = sum(r["p"] for r in probabilities if r["place"] == k + 1)
-            mean_cap = (sum(place_cap_samples[k]) / len(place_cap_samples[k])) if place_cap_samples[k] else float("nan")
+            nc = sum(newcomer_counts[k])
+            caps = [c for ri in range(n_reads) for c in place_cap_samples[k][ri]]
+            mean_cap = (sum(caps) / len(caps)) if caps else float("nan")
             print(f"[debug] place {k+1}: named_sum={named_sum:.3f} "
-                  f"newcomer_share={newcomer_counts[k] / total_samples:.3f} "
-                  f"mean_cap={mean_cap:.2f} n_cap={len(place_cap_samples[k])}", file=sys.stderr)
+                  f"newcomer_share={nc / total_samples:.3f} "
+                  f"mean_cap={mean_cap:.2f} n_cap={len(caps)}", file=sys.stderr)
     os.makedirs(output_dir, exist_ok=True)
     with open(os.path.join(output_dir, task.get("output", "forecast.json")), "w") as f:
         f.write(json.dumps(forecast) + "\n")
