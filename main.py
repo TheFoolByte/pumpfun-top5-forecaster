@@ -26,7 +26,11 @@ MAX_TRIALS = 2000
 MIN_TRIALS = 700
 CAND_MAX = 220
 # Drift: recent slope shrunk toward the global mean step; decays with time.
-DRIFT_SHRINK = 0.30
+# Shrink 0.50 (was 0.30): rolling-cut proxy mean -32.281 vs -33.191 at 0.30,
+# improving 4 of 5 cuts (A +0.55, B +0.70, C +1.60, L2 +1.69; L flat, it
+# trains on 1 mark so there is no slope to shrink). Less shrinkage trusts
+# recent momentum more, which the proxy says pays on memecoin caps.
+DRIFT_SHRINK = 0.50
 DRIFT_HALF_LIFE_MIN = 120.0
 POOL_DRIFT_BONUS = 0.01  # per 10-min step, pool coins only
 DRIFT_CLIP = (-0.05, 0.08)
